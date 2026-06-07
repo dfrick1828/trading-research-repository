@@ -1,33 +1,33 @@
-# Trading Research Repository
+# Discord Trading Research Repository
 
-A Streamlit MVP for a private trading group to upload TradeSteward-style trading history CSVs, normalize daily P/L data, and analyze individual and group performance.
+A no-login Streamlit app for Discord trading groups to upload TradeSteward-style CSV exports and view shared analytics.
 
-## What it does
+## Features
 
-- Upload CSV files from TradeSteward or similar exports
-- Map common column names like `OpenDate`, `Day`, `Date`, `TotalNetProfitLoss`, `Daily_PL`, `P/L`, `Net P/L`
-- Store raw uploads locally in `/data/uploads`
-- Store normalized daily results in a local SQLite database
-- Generate:
-  - Equity curves
-  - Drawdown curves
-  - Return distribution histogram
-  - Group summary statistics
-  - Trader comparison table
+- No login required
+- Discord handle field
+- Anonymous upload option
+- Strategy name field
+- Account size and notes fields
+- Toggle to show/hide results from the group dashboard
+- Standardizes TradeSteward-style date and P/L columns
+- Group equity curves
+- Drawdown curves
+- Daily P/L histograms
+- Trader summary statistics
+- Strategy breakdown
+- Downloadable standardized group dataset
 
-## Local setup
+## Deploy on Streamlit
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-streamlit run app.py
+Main file path:
+
+```text
+app.py
 ```
 
-## Important MVP notes
+Requirements are in `requirements.txt`.
 
-This first version uses local SQLite and local file storage. That is good for prototyping but not ideal for a live multi-user group. The next production step is Supabase/Postgres with authenticated users and row-level security.
+## Important MVP limitation
 
-## Privacy
-
-Use aliases like `Trader_001`, not real names. Avoid uploading account numbers, brokerage IDs, or personally identifying data.
+This version stores data in local SQLite and local upload files. On Streamlit Community Cloud, local storage can reset when the app restarts or redeploys. For real group use, the next upgrade should move storage to Supabase.
