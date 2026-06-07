@@ -17,19 +17,10 @@ A no-login Streamlit app for Discord trading groups to upload TradeSteward-style
 - Trader summary statistics
 - Strategy breakdown
 - Downloadable standardized group dataset
-
-## GARCH Volatility Dashboard
-
-The app now includes a GARCH-style volatility dashboard that:
-
-- Aggregates selected traders into one group book
-- Converts daily P/L to daily returns using uploaded account size, user override, or inferred capital base
-- Fits a simple zero-mean GARCH(1,1) model using maximum likelihood when enough observations exist
-- Falls back to stable default parameters when the sample is too small
-- Displays current volatility regime, annualized forecast volatility, next-day forecast volatility, and persistence
-- Compares GARCH volatility with 5-day and 20-day realized volatility
-- Shows return bars overlaid with forecast volatility
-- Summarizes performance in low, normal, and high volatility regimes
+- Volatility Trend dashboard
+- Rolling realized volatility
+- GARCH-style EWMA forecast volatility
+- Volatility regime classification
 
 ## Deploy on Streamlit
 
@@ -40,6 +31,10 @@ app.py
 ```
 
 Requirements are in `requirements.txt`.
+
+## Volatility note
+
+The volatility dashboard uses standardized daily P/L so traders with different account sizes can be compared by volatility regime. The GARCH-style forecast is an EWMA variance recursion designed to be lightweight and reliable on Streamlit Cloud. A future durable version can add account-size-normalized returns and a full GARCH package.
 
 ## Important MVP limitation
 

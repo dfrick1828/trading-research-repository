@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -10,13 +11,7 @@ from typing import Optional, Tuple
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
-
-try:
-    from scipy.optimize import minimize
-except Exception:  # Streamlit can still run basic dashboards if scipy install fails.
-    minimize = None
 
 APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "data"
@@ -75,6 +70,7 @@ def init_db() -> None:
             )
             """
         )
+        # Lightweight migrations for anyone who already deployed the first MVP.
         for table, columns in {
             "uploads": {
                 "discord_handle": "TEXT",
@@ -276,6 +272,61 @@ def add_metrics(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+
+def calculate_volatility_trend(df: pd.DataFrame, window: int = 20, annualization: int = 252) -> pd.DataFrame:
+    """
+    Build a visible volatility trend from daily P/L.
+
+    If account_size exists in the upload metadata later, this can be converted to true returns.
+    For the current no-login MVP, we standardize by each trader's own daily P/L volatility so
+    the chart compares volatility regimes rather than dollar size.
+    """
+    if df.empty:
+        return pd.DataFrame()
+
+    pieces = []
+    for trader, g in df.sort_values('trade_date').groupby('trader_alias'):
+        out = g.copy()
+        scale = out['daily_pl'].abs().median()
+        if not np.isfinite(scale) or scale == 0:
+            scale = out['daily_pl'].std()
+        if not np.isfinite(scale) or scale == 0:
+            scale = 1.0
+
+        out['standardized_return'] = out['daily_pl'] / scale
+        out['rolling_realized_vol'] = out['standardized_return'].rolling(window, min_periods=max(5, window // 4)).std() * np.sqrt(annualization)
+
+        # GARCH-style forecast using an EWMA variance recursion.
+        # This is intentionally dependency-light for Streamlit Cloud reliability.
+        lam = 0.94
+        values = out['standardized_return'].fillna(0).to_numpy(dtype=float)
+        if len(values) == 0:
+            continue
+        seed = np.nanvar(values[: min(len(values), window)])
+        if not np.isfinite(seed) or seed <= 0:
+            seed = np.nanvar(values) if np.isfinite(np.nanvar(values)) else 0.0
+        var = max(seed, 1e-8)
+        forecast = []
+        for r in values:
+            var = lam * var + (1 - lam) * (r ** 2)
+            forecast.append(np.sqrt(var * annualization))
+        out['garch_style_forecast_vol'] = forecast
+        pieces.append(out)
+
+    if not pieces:
+        return pd.DataFrame()
+    return pd.concat(pieces, ignore_index=True)
+
+
+def volatility_regime_label(value: float, q_low: float, q_high: float) -> str:
+    if not np.isfinite(value):
+        return 'Insufficient data'
+    if value >= q_high:
+        return 'High volatility'
+    if value <= q_low:
+        return 'Low volatility'
+    return 'Normal volatility'
+
 def summary_stats(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -293,102 +344,17 @@ def summary_stats(df: pd.DataFrame) -> pd.DataFrame:
     stats["profit_factor"] = grouped["daily_pl"].apply(
         lambda s: s[s > 0].sum() / abs(s[s < 0].sum()) if abs(s[s < 0].sum()) > 0 else np.nan
     ).values
-    stats["max_drawdown"] = grouped.apply(lambda g: add_metrics(g)["drawdown"].min()).values
+    stats["max_drawdown"] = grouped.apply(lambda g: add_metrics(g)["drawdown"].min(), include_groups=False).values
     stats["first_day"] = grouped["trade_date"].min().dt.date.values
     stats["last_day"] = grouped["trade_date"].max().dt.date.values
     return stats.sort_values("total_pl", ascending=False)
-
-
-def choose_scale(df: pd.DataFrame, account_size_override: float | None = None) -> float:
-    if account_size_override and account_size_override > 0:
-        return float(account_size_override)
-    uploads = load_uploads()
-    aliases = df["trader_alias"].dropna().unique().tolist()
-    acct = uploads[uploads["trader_alias"].isin(aliases)]["account_size"].dropna()
-    if len(acct) > 0 and acct.mean() > 0:
-        return float(acct.mean())
-    abs95 = df["daily_pl"].abs().quantile(0.95)
-    return max(float(abs95 * 20), 25_000.0)
-
-
-def build_volatility_series(df: pd.DataFrame, account_size_override: float | None = None) -> pd.DataFrame:
-    """Aggregate selected P/L and convert it to daily returns for volatility modeling."""
-    daily = df.groupby("trade_date", as_index=False)["daily_pl"].sum().sort_values("trade_date")
-    scale = choose_scale(df, account_size_override)
-    daily["return"] = daily["daily_pl"] / scale
-    daily["return_pct"] = daily["return"] * 100
-    daily["abs_return_pct"] = daily["return_pct"].abs()
-    daily["realized_vol_5d"] = daily["return"].rolling(5).std() * np.sqrt(252) * 100
-    daily["realized_vol_20d"] = daily["return"].rolling(20).std() * np.sqrt(252) * 100
-    return daily
-
-
-def garch_neg_loglik(params: np.ndarray, r: np.ndarray) -> float:
-    omega, alpha, beta = params
-    if omega <= 0 or alpha < 0 or beta < 0 or alpha + beta >= 0.999:
-        return 1e12
-    var = np.empty_like(r)
-    var0 = max(np.var(r), 1e-8)
-    var[0] = var0
-    for i in range(1, len(r)):
-        var[i] = omega + alpha * r[i - 1] ** 2 + beta * var[i - 1]
-        if var[i] <= 0 or not np.isfinite(var[i]):
-            return 1e12
-    return float(0.5 * np.sum(np.log(2 * np.pi) + np.log(var) + (r ** 2 / var)))
-
-
-def fit_garch_11(returns: pd.Series) -> tuple[pd.DataFrame, dict]:
-    """Fit a simple zero-mean GARCH(1,1). Falls back to stable defaults when sample is small."""
-    r = returns.dropna().astype(float).values
-    r = r[np.isfinite(r)]
-    if len(r) < 15:
-        params = {"omega": np.nan, "alpha": 0.10, "beta": 0.85, "persistence": 0.95, "method": "default: need 15+ observations"}
-    elif minimize is None:
-        params = {"omega": max(np.var(r) * 0.05, 1e-8), "alpha": 0.10, "beta": 0.85, "persistence": 0.95, "method": "default: scipy unavailable"}
-    else:
-        var = max(np.var(r), 1e-8)
-        x0 = np.array([var * 0.05, 0.10, 0.85])
-        bounds = [(1e-10, var * 10 + 1e-6), (0.001, 0.40), (0.001, 0.98)]
-        constraints = ({"type": "ineq", "fun": lambda x: 0.999 - x[1] - x[2]},)
-        result = minimize(garch_neg_loglik, x0, args=(r,), method="SLSQP", bounds=bounds, constraints=constraints, options={"maxiter": 500})
-        if result.success:
-            omega, alpha, beta = result.x
-            params = {"omega": float(omega), "alpha": float(alpha), "beta": float(beta), "persistence": float(alpha + beta), "method": "maximum likelihood"}
-        else:
-            params = {"omega": var * 0.05, "alpha": 0.10, "beta": 0.85, "persistence": 0.95, "method": "fallback: optimizer failed"}
-
-    omega = params["omega"] if np.isfinite(params["omega"]) else max(np.var(r) * 0.05 if len(r) else 1e-6, 1e-8)
-    alpha, beta = params["alpha"], params["beta"]
-    var_path = np.empty(len(r))
-    var_path[0] = max(np.var(r), 1e-8) if len(r) else 1e-8
-    for i in range(1, len(r)):
-        var_path[i] = omega + alpha * r[i - 1] ** 2 + beta * var_path[i - 1]
-    model = pd.DataFrame({"return": r, "garch_daily_vol": np.sqrt(var_path), "garch_annual_vol_pct": np.sqrt(var_path) * np.sqrt(252) * 100})
-    if len(r):
-        next_var = omega + alpha * r[-1] ** 2 + beta * var_path[-1]
-        params["next_day_vol_pct"] = float(np.sqrt(next_var) * 100)
-        params["next_annual_vol_pct"] = float(np.sqrt(next_var) * np.sqrt(252) * 100)
-    else:
-        params["next_day_vol_pct"] = np.nan
-        params["next_annual_vol_pct"] = np.nan
-    return model, params
-
-
-def classify_regime(vol: float, q_low: float, q_high: float) -> str:
-    if not np.isfinite(vol):
-        return "Unknown"
-    if vol <= q_low:
-        return "Low volatility"
-    if vol >= q_high:
-        return "High volatility"
-    return "Normal volatility"
 
 
 st.set_page_config(page_title="Discord Trading Research Repository", layout="wide")
 init_db()
 
 st.title("Discord Trading Research Repository")
-st.caption("Open upload portal for TradeSteward-style CSVs with shared performance and GARCH-style volatility analytics.")
+st.caption("Open upload portal for TradeSteward-style CSVs. No login required. Use a Discord handle or stay anonymous.")
 
 with st.sidebar:
     st.header("Upload Trading History")
@@ -427,134 +393,122 @@ uploads_df = load_uploads()
 
 if public_results.empty:
     st.info("Upload a CSV to begin. The app expects a date column and a daily P/L column.")
+    if not uploads_df.empty:
+        st.subheader("Private/hidden uploads exist")
+        st.write("Some uploads may be hidden from the group dashboard because the uploader unchecked the visibility box.")
     st.stop()
+
+st.subheader("Group Dashboard")
+summary = summary_stats(public_results)
+
+metric_cols = st.columns(4)
+metric_cols[0].metric("Visible traders", public_results["trader_alias"].nunique())
+metric_cols[1].metric("Total trading days", f"{len(public_results):,}")
+metric_cols[2].metric("Group net P/L", f"${public_results['daily_pl'].sum():,.0f}")
+metric_cols[3].metric("Uploads", f"{len(uploads_df):,}")
 
 traders = sorted(public_results["trader_alias"].dropna().unique())
 selected_traders = st.multiselect("Show traders", traders, default=traders)
 filtered = public_results[public_results["trader_alias"].isin(selected_traders)].copy()
 
-if filtered.empty:
-    st.warning("Select at least one trader.")
-    st.stop()
+st.subheader("Volatility Trend")
+st.caption("This section shows the volatility trend directly: rolling realized volatility and a GARCH-style EWMA volatility forecast from standardized daily P/L. It is designed for relative regime detection across traders, not brokerage-grade risk reporting yet.")
 
-tab_group, tab_vol, tab_strategy, tab_export = st.tabs(["Group Dashboard", "GARCH Volatility", "Strategy Breakdown", "Data / Export"])
+vol_window = st.slider("Rolling volatility window", min_value=5, max_value=60, value=20, step=5)
+vol_df = calculate_volatility_trend(filtered, window=vol_window)
 
-with tab_group:
-    st.subheader("Group Dashboard")
-    metric_cols = st.columns(4)
-    metric_cols[0].metric("Visible traders", filtered["trader_alias"].nunique())
-    metric_cols[1].metric("Trading rows", f"{len(filtered):,}")
-    metric_cols[2].metric("Net P/L", f"${filtered['daily_pl'].sum():,.0f}")
-    metric_cols[3].metric("Uploads", f"{len(uploads_df):,}")
+if vol_df.empty or vol_df["rolling_realized_vol"].dropna().empty:
+    st.info("Upload more trading days to show a volatility trend. The chart needs several observations before rolling volatility is meaningful.")
+else:
+    latest_vol = (
+        vol_df.sort_values("trade_date")
+        .groupby("trader_alias")
+        .tail(1)[["trader_alias", "rolling_realized_vol", "garch_style_forecast_vol"]]
+        .copy()
+    )
+    q_low = vol_df["garch_style_forecast_vol"].quantile(0.25)
+    q_high = vol_df["garch_style_forecast_vol"].quantile(0.75)
+    latest_vol["regime"] = latest_vol["garch_style_forecast_vol"].apply(lambda x: volatility_regime_label(x, q_low, q_high))
 
-    left, right = st.columns([2, 1])
-    with right:
-        st.markdown("### Summary")
-        stats = summary_stats(filtered)
+    vcols = st.columns(3)
+    vcols[0].metric("Latest realized vol", f"{latest_vol['rolling_realized_vol'].mean():.2f}x")
+    vcols[1].metric("Latest forecast vol", f"{latest_vol['garch_style_forecast_vol'].mean():.2f}x")
+    vcols[2].metric("Group regime", volatility_regime_label(latest_vol['garch_style_forecast_vol'].mean(), q_low, q_high))
+
+    vol_long = vol_df.melt(
+        id_vars=["trade_date", "trader_alias"],
+        value_vars=["rolling_realized_vol", "garch_style_forecast_vol"],
+        var_name="volatility_measure",
+        value_name="volatility",
+    ).dropna(subset=["volatility"])
+    vol_long["volatility_measure"] = vol_long["volatility_measure"].replace({
+        "rolling_realized_vol": "Rolling realized volatility",
+        "garch_style_forecast_vol": "GARCH-style forecast volatility",
+    })
+    fig_vol = px.line(
+        vol_long,
+        x="trade_date",
+        y="volatility",
+        color="trader_alias",
+        line_dash="volatility_measure",
+        title="Volatility Trend: Realized vs Forecast",
+    )
+    st.plotly_chart(fig_vol, use_container_width=True)
+
+    with st.expander("Latest volatility regime by trader"):
         st.dataframe(
-            stats.style.format({
-                "total_pl": "${:,.0f}",
-                "avg_day": "${:,.0f}",
-                "median_day": "${:,.0f}",
-                "std_day": "${:,.0f}",
-                "best_day": "${:,.0f}",
-                "worst_day": "${:,.0f}",
-                "win_rate": "{:.1%}",
-                "profit_factor": "{:.2f}",
-                "max_drawdown": "${:,.0f}",
+            latest_vol.style.format({
+                "rolling_realized_vol": "{:.2f}x",
+                "garch_style_forecast_vol": "{:.2f}x",
             }),
             use_container_width=True,
         )
 
-    with left:
-        st.markdown("### Equity Curves")
-        curve_df = pd.concat([add_metrics(g) for _, g in filtered.groupby("trader_alias")], ignore_index=True)
-        fig = px.line(curve_df, x="trade_date", y="cumulative_pl", color="trader_alias", title="Cumulative P/L")
-        st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("### Drawdowns")
-    fig_dd = px.line(curve_df, x="trade_date", y="drawdown", color="trader_alias", title="Drawdown from Running Peak")
-    st.plotly_chart(fig_dd, use_container_width=True)
-
-    st.markdown("### Daily P/L Distribution")
-    fig_hist = px.histogram(filtered, x="daily_pl", color="trader_alias", nbins=60, marginal="box", title="Daily P/L Histogram")
-    st.plotly_chart(fig_hist, use_container_width=True)
-
-with tab_vol:
-    st.subheader("GARCH Volatility Dashboard")
-    st.caption("Models selected traders as one aggregate book. P/L is converted to return using account size when available, otherwise a conservative inferred capital base.")
-
-    acct_override = st.number_input("Override capital base for return conversion", min_value=0.0, value=0.0, step=5000.0, help="Use this if uploaded account sizes are missing or inconsistent. Leave at 0 to infer.")
-    daily = build_volatility_series(filtered, acct_override if acct_override > 0 else None)
-    model, params = fit_garch_11(daily["return"])
-    model["trade_date"] = daily["trade_date"].values[: len(model)]
-    model["daily_pl"] = daily["daily_pl"].values[: len(model)]
-    model["return_pct"] = daily["return_pct"].values[: len(model)]
-    model["realized_vol_5d"] = daily["realized_vol_5d"].values[: len(model)]
-    model["realized_vol_20d"] = daily["realized_vol_20d"].values[: len(model)]
-
-    q_low = model["garch_annual_vol_pct"].quantile(0.25)
-    q_high = model["garch_annual_vol_pct"].quantile(0.75)
-    current_vol = model["garch_annual_vol_pct"].iloc[-1] if len(model) else np.nan
-    current_regime = classify_regime(current_vol, q_low, q_high)
-
-    cols = st.columns(5)
-    cols[0].metric("Current regime", current_regime)
-    cols[1].metric("GARCH annual vol", f"{current_vol:,.1f}%" if np.isfinite(current_vol) else "n/a")
-    cols[2].metric("Next-day vol forecast", f"{params['next_day_vol_pct']:,.2f}%" if np.isfinite(params["next_day_vol_pct"]) else "n/a")
-    cols[3].metric("Persistence α+β", f"{params['persistence']:.3f}" if np.isfinite(params["persistence"]) else "n/a")
-    cols[4].metric("Model method", params["method"])
-
-    st.markdown("### Volatility Forecast")
-    fig_vol = go.Figure()
-    fig_vol.add_trace(go.Scatter(x=model["trade_date"], y=model["garch_annual_vol_pct"], mode="lines", name="GARCH annualized vol"))
-    fig_vol.add_trace(go.Scatter(x=model["trade_date"], y=model["realized_vol_20d"], mode="lines", name="20-day realized vol"))
-    fig_vol.add_trace(go.Scatter(x=model["trade_date"], y=model["realized_vol_5d"], mode="lines", name="5-day realized vol"))
-    fig_vol.add_hrect(y0=0, y1=q_low, opacity=0.08, line_width=0, annotation_text="Low", annotation_position="top left")
-    fig_vol.add_hrect(y0=q_high, y1=max(model["garch_annual_vol_pct"].max() * 1.05, q_high), opacity=0.08, line_width=0, annotation_text="High", annotation_position="top left")
-    fig_vol.update_layout(yaxis_title="Annualized volatility (%)", xaxis_title="Date", hovermode="x unified")
-    st.plotly_chart(fig_vol, use_container_width=True)
-
-    st.markdown("### Returns vs Volatility")
-    fig_combo = go.Figure()
-    fig_combo.add_trace(go.Bar(x=model["trade_date"], y=model["return_pct"], name="Daily return %", yaxis="y"))
-    fig_combo.add_trace(go.Scatter(x=model["trade_date"], y=model["garch_annual_vol_pct"], mode="lines", name="GARCH annual vol %", yaxis="y2"))
-    fig_combo.update_layout(
-        yaxis=dict(title="Daily return (%)"),
-        yaxis2=dict(title="Annualized vol (%)", overlaying="y", side="right"),
-        hovermode="x unified",
-    )
-    st.plotly_chart(fig_combo, use_container_width=True)
-
-    st.markdown("### Regime Performance")
-    model["regime"] = model["garch_annual_vol_pct"].apply(lambda v: classify_regime(v, q_low, q_high))
-    regime_stats = model.groupby("regime").agg(
-        days=("return", "count"),
-        avg_return_pct=("return_pct", "mean"),
-        total_pl=("daily_pl", "sum"),
-        worst_day_pct=("return_pct", "min"),
-        best_day_pct=("return_pct", "max"),
-    ).reset_index()
-    st.dataframe(regime_stats.style.format({"avg_return_pct": "{:.2f}%", "total_pl": "${:,.0f}", "worst_day_pct": "{:.2f}%", "best_day_pct": "{:.2f}%"}), use_container_width=True)
-
-    with st.expander("Model parameters"):
-        st.write({k: v for k, v in params.items() if k in ["omega", "alpha", "beta", "persistence", "method"]})
-        st.write("Interpretation: higher persistence means volatility shocks decay more slowly. For short-vol / premium strategies, rising forecast volatility can be treated as a sizing or caution signal rather than a directional prediction.")
-
-with tab_strategy:
-    st.subheader("Strategy Breakdown")
-    strategy = filtered.groupby(["trader_alias", "strategy"], dropna=False)["daily_pl"].agg(["count", "sum", "mean", "min", "max"]).reset_index()
+left, right = st.columns([2, 1])
+with right:
+    st.markdown("### Summary")
+    stats = summary_stats(filtered)
     st.dataframe(
-        strategy.style.format({"sum": "${:,.0f}", "mean": "${:,.0f}", "min": "${:,.0f}", "max": "${:,.0f}"}),
+        stats.style.format({
+            "total_pl": "${:,.0f}",
+            "avg_day": "${:,.0f}",
+            "median_day": "${:,.0f}",
+            "std_day": "${:,.0f}",
+            "best_day": "${:,.0f}",
+            "worst_day": "${:,.0f}",
+            "win_rate": "{:.1%}",
+            "profit_factor": "{:.2f}",
+            "max_drawdown": "${:,.0f}",
+        }),
         use_container_width=True,
     )
 
-with tab_export:
-    st.subheader("Data / Export")
-    with st.expander("Recent uploads", expanded=True):
-        display_uploads = uploads_df[["uploaded_at", "trader_alias", "strategy_name", "row_count", "show_in_group", "original_filename"]].copy()
-        st.dataframe(display_uploads, use_container_width=True)
+with left:
+    st.markdown("### Equity Curves")
+    curve_df = pd.concat([add_metrics(g) for _, g in filtered.groupby("trader_alias")], ignore_index=True)
+    fig = px.line(curve_df, x="trade_date", y="cumulative_pl", color="trader_alias", title="Cumulative P/L")
+    st.plotly_chart(fig, use_container_width=True)
 
+st.markdown("### Drawdowns")
+fig_dd = px.line(curve_df, x="trade_date", y="drawdown", color="trader_alias", title="Drawdown from Running Peak")
+st.plotly_chart(fig_dd, use_container_width=True)
+
+st.markdown("### Daily P/L Distribution")
+fig_hist = px.histogram(filtered, x="daily_pl", color="trader_alias", nbins=60, marginal="box", title="Daily P/L Histogram")
+st.plotly_chart(fig_hist, use_container_width=True)
+
+st.markdown("### Strategy Breakdown")
+strategy = filtered.groupby(["trader_alias", "strategy"], dropna=False)["daily_pl"].agg(["count", "sum", "mean", "min", "max"]).reset_index()
+st.dataframe(
+    strategy.style.format({"sum": "${:,.0f}", "mean": "${:,.0f}", "min": "${:,.0f}", "max": "${:,.0f}"}),
+    use_container_width=True,
+)
+
+with st.expander("Recent uploads"):
+    display_uploads = uploads_df[["uploaded_at", "trader_alias", "strategy_name", "row_count", "show_in_group", "original_filename"]].copy()
+    st.dataframe(display_uploads, use_container_width=True)
+
+with st.expander("Export visible standardized dataset"):
     csv = public_results.to_csv(index=False).encode("utf-8")
     st.download_button("Download standardized group CSV", csv, "standardized_group_trading_history.csv", "text/csv")
 
