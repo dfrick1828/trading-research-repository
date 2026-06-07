@@ -1,8 +1,8 @@
+
 from __future__ import annotations
 
 import hashlib
 import io
-import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -11,6 +11,7 @@ from typing import Optional, Tuple
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 APP_DIR = Path(__file__).parent
@@ -30,6 +31,9 @@ PL_CANDIDATES = [
 ]
 STRATEGY_CANDIDATES = ["strategy", "system", "setup", "tag", "model"]
 TRADE_COUNT_CANDIDATES = ["trades", "trade count", "number of trades", "count"]
+
+TRADING_DAYS_ONE_MONTH = 21
+N_SIMULATIONS = 5000
 
 
 def init_db() -> None:
@@ -70,7 +74,6 @@ def init_db() -> None:
             )
             """
         )
-        # Lightweight migrations for anyone who already deployed the first MVP.
         for table, columns in {
             "uploads": {
                 "discord_handle": "TEXT",
@@ -186,8 +189,7 @@ def save_upload(
     upload_id = digest[:16]
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     stored_filename = f"{timestamp}_{upload_id}_{uploaded_file.name}"
-    stored_path = UPLOAD_DIR / stored_filename
-    stored_path.write_bytes(content)
+    (UPLOAD_DIR / stored_filename).write_bytes(content)
 
     raw_df = pd.read_csv(io.BytesIO(content))
     normalized, mapping = normalize_tradesteward_csv(raw_df, strategy_name or "Unspecified")
@@ -248,20 +250,29 @@ def save_upload(
 
 
 def load_daily_results(public_only: bool = True) -> pd.DataFrame:
-    where = "WHERE show_in_group = 1" if public_only else ""
+    where = "WHERE d.show_in_group = 1" if public_only else ""
     with sqlite3.connect(DB_PATH) as conn:
-        df = pd.read_sql_query(f"SELECT * FROM daily_results {where}", conn)
+        df = pd.read_sql_query(
+            f"""
+            SELECT d.*, u.account_size, u.uploaded_at, u.original_filename
+            FROM daily_results d
+            LEFT JOIN uploads u ON d.upload_id = u.upload_id
+            {where}
+            """,
+            conn,
+        )
     if df.empty:
         return df
     df["trade_date"] = pd.to_datetime(df["trade_date"])
     df["daily_pl"] = pd.to_numeric(df["daily_pl"], errors="coerce")
+    df["account_size"] = pd.to_numeric(df["account_size"], errors="coerce")
+    df["daily_return"] = np.where(df["account_size"] > 0, df["daily_pl"] / df["account_size"], np.nan)
     return df
 
 
 def load_uploads() -> pd.DataFrame:
     with sqlite3.connect(DB_PATH) as conn:
-        df = pd.read_sql_query("SELECT * FROM uploads ORDER BY uploaded_at DESC", conn)
-    return df
+        return pd.read_sql_query("SELECT * FROM uploads ORDER BY uploaded_at DESC", conn)
 
 
 def add_metrics(df: pd.DataFrame) -> pd.DataFrame:
@@ -269,63 +280,14 @@ def add_metrics(df: pd.DataFrame) -> pd.DataFrame:
     out["cumulative_pl"] = out["daily_pl"].cumsum()
     out["running_peak"] = out["cumulative_pl"].cummax()
     out["drawdown"] = out["cumulative_pl"] - out["running_peak"]
+    if out["daily_return"].notna().any():
+        out["growth_index"] = 100 * (1 + out["daily_return"].fillna(0)).cumprod()
+        out["cumulative_return_pct"] = out["growth_index"] - 100
+    else:
+        out["growth_index"] = 100 + out["cumulative_pl"]
+        out["cumulative_return_pct"] = out["cumulative_pl"]
     return out
 
-
-
-def calculate_volatility_trend(df: pd.DataFrame, window: int = 20, annualization: int = 252) -> pd.DataFrame:
-    """
-    Build a visible volatility trend from daily P/L.
-
-    If account_size exists in the upload metadata later, this can be converted to true returns.
-    For the current no-login MVP, we standardize by each trader's own daily P/L volatility so
-    the chart compares volatility regimes rather than dollar size.
-    """
-    if df.empty:
-        return pd.DataFrame()
-
-    pieces = []
-    for trader, g in df.sort_values('trade_date').groupby('trader_alias'):
-        out = g.copy()
-        scale = out['daily_pl'].abs().median()
-        if not np.isfinite(scale) or scale == 0:
-            scale = out['daily_pl'].std()
-        if not np.isfinite(scale) or scale == 0:
-            scale = 1.0
-
-        out['standardized_return'] = out['daily_pl'] / scale
-        out['rolling_realized_vol'] = out['standardized_return'].rolling(window, min_periods=max(5, window // 4)).std() * np.sqrt(annualization)
-
-        # GARCH-style forecast using an EWMA variance recursion.
-        # This is intentionally dependency-light for Streamlit Cloud reliability.
-        lam = 0.94
-        values = out['standardized_return'].fillna(0).to_numpy(dtype=float)
-        if len(values) == 0:
-            continue
-        seed = np.nanvar(values[: min(len(values), window)])
-        if not np.isfinite(seed) or seed <= 0:
-            seed = np.nanvar(values) if np.isfinite(np.nanvar(values)) else 0.0
-        var = max(seed, 1e-8)
-        forecast = []
-        for r in values:
-            var = lam * var + (1 - lam) * (r ** 2)
-            forecast.append(np.sqrt(var * annualization))
-        out['garch_style_forecast_vol'] = forecast
-        pieces.append(out)
-
-    if not pieces:
-        return pd.DataFrame()
-    return pd.concat(pieces, ignore_index=True)
-
-
-def volatility_regime_label(value: float, q_low: float, q_high: float) -> str:
-    if not np.isfinite(value):
-        return 'Insufficient data'
-    if value >= q_high:
-        return 'High volatility'
-    if value <= q_low:
-        return 'Low volatility'
-    return 'Normal volatility'
 
 def summary_stats(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -344,24 +306,168 @@ def summary_stats(df: pd.DataFrame) -> pd.DataFrame:
     stats["profit_factor"] = grouped["daily_pl"].apply(
         lambda s: s[s > 0].sum() / abs(s[s < 0].sum()) if abs(s[s < 0].sum()) > 0 else np.nan
     ).values
-    stats["max_drawdown"] = grouped.apply(lambda g: add_metrics(g)["drawdown"].min(), include_groups=False).values
     stats["first_day"] = grouped["trade_date"].min().dt.date.values
     stats["last_day"] = grouped["trade_date"].max().dt.date.values
+
+    if "daily_return" in df.columns and df["daily_return"].notna().any():
+        ret_stats = grouped["daily_return"].apply(lambda s: (1 + s.dropna()).prod() - 1 if s.dropna().size else np.nan)
+        stats["total_return"] = stats["trader_alias"].map(ret_stats)
+        stats["daily_vol"] = stats["trader_alias"].map(grouped["daily_return"].std())
     return stats.sort_values("total_pl", ascending=False)
 
 
-st.set_page_config(page_title="Discord Trading Research Repository", layout="wide")
+def ewma_volatility(returns: pd.Series, lam: float = 0.94) -> float:
+    r = returns.dropna().astype(float)
+    if len(r) < 3:
+        return float(r.std()) if len(r) > 1 else 0.0
+    variance = float(r.var())
+    for x in r.iloc[-60:]:
+        variance = lam * variance + (1 - lam) * float(x) ** 2
+    return float(np.sqrt(max(variance, 0)))
+
+
+def volatility_regime_label(vol: float, historical_vols: pd.Series) -> str:
+    hv = historical_vols.dropna()
+    if len(hv) < 10 or not np.isfinite(vol):
+        return "Insufficient history"
+    p50, p75, p90 = hv.quantile([0.50, 0.75, 0.90])
+    if vol < p50:
+        return "Low volatility"
+    if vol < p75:
+        return "Normal volatility"
+    if vol < p90:
+        return "High volatility"
+    return "Extreme volatility"
+
+
+def build_projection(df: pd.DataFrame, selected_traders: list[str], horizon_days: int = TRADING_DAYS_ONE_MONTH) -> tuple[pd.DataFrame, dict]:
+    work = df[df["trader_alias"].isin(selected_traders)].copy()
+    use_returns = work["daily_return"].notna().sum() >= 20
+
+    if use_returns:
+        daily = (
+            work.dropna(subset=["daily_return"])
+            .groupby("trade_date")["daily_return"]
+            .mean()
+            .sort_index()
+        )
+        units = "return"
+        value_suffix = "%"
+        multiplier = 100.0
+    else:
+        daily = work.groupby("trade_date")["daily_pl"].sum().sort_index()
+        units = "P/L"
+        value_suffix = " dollars"
+        multiplier = 1.0
+
+    daily = daily.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(daily) < 10:
+        return pd.DataFrame(), {"error": "Need at least 10 historical trading days to build a projection."}
+
+    drift = float(daily.tail(63).mean()) if len(daily) >= 20 else float(daily.mean())
+    realized_vol = float(daily.tail(min(21, len(daily))).std())
+    forecast_vol = ewma_volatility(daily)
+    if not np.isfinite(forecast_vol) or forecast_vol <= 0:
+        forecast_vol = realized_vol if np.isfinite(realized_vol) else 0.0
+
+    # Conservative blend: recent average drift, with volatility from EWMA/GARCH-style forecast.
+    # Drift is clipped so a hot or cold sample does not dominate the one-month projection.
+    vol_cap = max(forecast_vol, 1e-9)
+    drift = float(np.clip(drift, -0.35 * vol_cap, 0.35 * vol_cap))
+
+    rng = np.random.default_rng(42)
+    shocks = rng.normal(loc=drift, scale=forecast_vol, size=(N_SIMULATIONS, horizon_days))
+
+    if use_returns:
+        paths = (1 + shocks).cumprod(axis=1) - 1
+    else:
+        paths = shocks.cumsum(axis=1)
+
+    quantiles = np.percentile(paths, [10, 25, 50, 75, 90], axis=0)
+    projection = pd.DataFrame({
+        "day": np.arange(1, horizon_days + 1),
+        "p10": quantiles[0] * multiplier,
+        "p25": quantiles[1] * multiplier,
+        "median": quantiles[2] * multiplier,
+        "p75": quantiles[3] * multiplier,
+        "p90": quantiles[4] * multiplier,
+    })
+
+    rolling_vol = daily.rolling(21, min_periods=5).std()
+    meta = {
+        "units": units,
+        "value_suffix": value_suffix,
+        "use_returns": use_returns,
+        "history_days": len(daily),
+        "daily_drift": drift * multiplier,
+        "daily_forecast_vol": forecast_vol * multiplier,
+        "monthly_median": float(projection["median"].iloc[-1]),
+        "monthly_p10": float(projection["p10"].iloc[-1]),
+        "monthly_p90": float(projection["p90"].iloc[-1]),
+        "regime": volatility_regime_label(forecast_vol, rolling_vol),
+    }
+    return projection, meta
+
+
+def plot_projection(projection: pd.DataFrame, meta: dict) -> go.Figure:
+    y_title = "Projected return (%)" if meta.get("use_returns") else "Projected P/L ($)"
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=projection["day"], y=projection["p90"], line=dict(width=0), showlegend=False, hoverinfo="skip"
+    ))
+    fig.add_trace(go.Scatter(
+        x=projection["day"], y=projection["p10"], fill="tonexty", line=dict(width=0),
+        name="10%–90% range", hovertemplate="Day %{x}<br>Lower band: %{y:.2f}<extra></extra>"
+    ))
+    fig.add_trace(go.Scatter(
+        x=projection["day"], y=projection["p75"], line=dict(width=0), showlegend=False, hoverinfo="skip"
+    ))
+    fig.add_trace(go.Scatter(
+        x=projection["day"], y=projection["p25"], fill="tonexty", line=dict(width=0),
+        name="25%–75% range", hovertemplate="Day %{x}<br>Lower quartile: %{y:.2f}<extra></extra>"
+    ))
+    fig.add_trace(go.Scatter(
+        x=projection["day"], y=projection["median"], mode="lines", name="Median projection",
+        hovertemplate="Day %{x}<br>Median: %{y:.2f}<extra></extra>"
+    ))
+    fig.add_hline(y=0, line_dash="dot")
+    fig.update_layout(
+        title="Projected Next 1-Month Return Path",
+        xaxis_title="Trading days forward",
+        yaxis_title=y_title,
+        hovermode="x unified",
+        legend_title_text="Projection",
+    )
+    return fig
+
+
+def build_volatility_trend(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for trader, g in df.groupby("trader_alias"):
+        g = g.sort_values("trade_date").copy()
+        series = g["daily_return"].dropna() if g["daily_return"].notna().sum() >= 10 else g["daily_pl"].dropna()
+        if len(series) < 5:
+            continue
+        g2 = g.iloc[-len(series):].copy()
+        g2["realized_vol_20d"] = series.rolling(20, min_periods=5).std().values
+        g2["forecast_vol"] = [ewma_volatility(series.iloc[: i + 1]) for i in range(len(series))]
+        g2["trader_alias"] = trader
+        rows.append(g2[["trade_date", "trader_alias", "realized_vol_20d", "forecast_vol"]])
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+st.set_page_config(page_title="ALGO Edge Performance History", layout="wide")
 init_db()
 
-st.title("Discord Trading Research Repository")
-st.caption("Open upload portal for TradeSteward-style CSVs. No login required. Use a Discord handle or stay anonymous.")
+st.title("ALGO Edge Performance History")
+st.caption("Performance analytics, volatility research, and regime monitoring for systematic traders.")
 
 with st.sidebar:
-    st.header("Upload Trading History")
+    st.header("Contribute Performance Data")
     discord_handle = st.text_input("Discord handle", placeholder="@your_handle")
     anonymous = st.checkbox("Upload anonymously", value=False)
-    strategy_name = st.text_input("Strategy name", placeholder="0DTE Range / Power Hour / etc.")
-    account_size = st.number_input("Approx. account size (optional)", min_value=0.0, value=0.0, step=1000.0)
+    strategy_name = st.text_input("Strategy name", placeholder="Optional")
+    account_size = st.number_input("Approx. account size for return normalization", min_value=0.0, value=0.0, step=1000.0)
     notes = st.text_area("Notes / setup description", placeholder="Optional: time period, sizing, symbols, risk rules...")
     show_in_group = st.checkbox("Show my results in the group dashboard", value=True)
     uploaded = st.file_uploader("Upload TradeSteward CSV", type=["csv"])
@@ -393,120 +499,121 @@ uploads_df = load_uploads()
 
 if public_results.empty:
     st.info("Upload a CSV to begin. The app expects a date column and a daily P/L column.")
-    if not uploads_df.empty:
-        st.subheader("Private/hidden uploads exist")
-        st.write("Some uploads may be hidden from the group dashboard because the uploader unchecked the visibility box.")
     st.stop()
-
-st.subheader("Group Dashboard")
-summary = summary_stats(public_results)
-
-metric_cols = st.columns(4)
-metric_cols[0].metric("Visible traders", public_results["trader_alias"].nunique())
-metric_cols[1].metric("Total trading days", f"{len(public_results):,}")
-metric_cols[2].metric("Group net P/L", f"${public_results['daily_pl'].sum():,.0f}")
-metric_cols[3].metric("Uploads", f"{len(uploads_df):,}")
 
 traders = sorted(public_results["trader_alias"].dropna().unique())
 selected_traders = st.multiselect("Show traders", traders, default=traders)
 filtered = public_results[public_results["trader_alias"].isin(selected_traders)].copy()
 
-st.subheader("Volatility Trend")
-st.caption("This section shows the volatility trend directly: rolling realized volatility and a GARCH-style EWMA volatility forecast from standardized daily P/L. It is designed for relative regime detection across traders, not brokerage-grade risk reporting yet.")
-
-vol_window = st.slider("Rolling volatility window", min_value=5, max_value=60, value=20, step=5)
-vol_df = calculate_volatility_trend(filtered, window=vol_window)
-
-if vol_df.empty or vol_df["rolling_realized_vol"].dropna().empty:
-    st.info("Upload more trading days to show a volatility trend. The chart needs several observations before rolling volatility is meaningful.")
+st.subheader("Projected 1-Month Return")
+projection, projection_meta = build_projection(public_results, selected_traders)
+if projection.empty:
+    st.warning(projection_meta.get("error", "Projection could not be built from the available history."))
 else:
-    latest_vol = (
-        vol_df.sort_values("trade_date")
-        .groupby("trader_alias")
-        .tail(1)[["trader_alias", "rolling_realized_vol", "garch_style_forecast_vol"]]
-        .copy()
+    pcols = st.columns(4)
+    if projection_meta["use_returns"]:
+        pcols[0].metric("Median 1-month projection", f"{projection_meta['monthly_median']:.2f}%")
+        pcols[1].metric("10% downside case", f"{projection_meta['monthly_p10']:.2f}%")
+        pcols[2].metric("90% upside case", f"{projection_meta['monthly_p90']:.2f}%")
+        pcols[3].metric("Current volatility regime", projection_meta["regime"])
+    else:
+        pcols[0].metric("Median 1-month projection", f"${projection_meta['monthly_median']:,.0f}")
+        pcols[1].metric("10% downside case", f"${projection_meta['monthly_p10']:,.0f}")
+        pcols[2].metric("90% upside case", f"${projection_meta['monthly_p90']:,.0f}")
+        pcols[3].metric("Current volatility regime", projection_meta["regime"])
+    st.plotly_chart(plot_projection(projection, projection_meta), use_container_width=True)
+    if not projection_meta["use_returns"]:
+        st.info("Projection is shown in dollars because fewer than 20 rows had account size data. Add account size on upload to enable percent return projections.")
+    st.caption(
+        "Projection uses historical daily results, an EWMA/GARCH-style volatility forecast, and 5,000 Monte Carlo paths over 21 trading days. "
+        "It is a risk model, not a promise of future performance."
     )
-    q_low = vol_df["garch_style_forecast_vol"].quantile(0.25)
-    q_high = vol_df["garch_style_forecast_vol"].quantile(0.75)
-    latest_vol["regime"] = latest_vol["garch_style_forecast_vol"].apply(lambda x: volatility_regime_label(x, q_low, q_high))
 
-    vcols = st.columns(3)
-    vcols[0].metric("Latest realized vol", f"{latest_vol['rolling_realized_vol'].mean():.2f}x")
-    vcols[1].metric("Latest forecast vol", f"{latest_vol['garch_style_forecast_vol'].mean():.2f}x")
-    vcols[2].metric("Group regime", volatility_regime_label(latest_vol['garch_style_forecast_vol'].mean(), q_low, q_high))
+st.subheader("Community Performance Dashboard")
+metric_cols = st.columns(4)
+metric_cols[0].metric("Visible traders", filtered["trader_alias"].nunique())
+metric_cols[1].metric("Trading days analyzed", f"{len(filtered):,}")
+metric_cols[2].metric("Aggregate net P/L", f"${filtered['daily_pl'].sum():,.0f}")
+metric_cols[3].metric("Uploads", f"{len(uploads_df):,}")
 
-    vol_long = vol_df.melt(
-        id_vars=["trade_date", "trader_alias"],
-        value_vars=["rolling_realized_vol", "garch_style_forecast_vol"],
-        var_name="volatility_measure",
-        value_name="volatility",
-    ).dropna(subset=["volatility"])
-    vol_long["volatility_measure"] = vol_long["volatility_measure"].replace({
-        "rolling_realized_vol": "Rolling realized volatility",
-        "garch_style_forecast_vol": "GARCH-style forecast volatility",
-    })
-    fig_vol = px.line(
-        vol_long,
-        x="trade_date",
-        y="volatility",
-        color="trader_alias",
-        line_dash="volatility_measure",
-        title="Volatility Trend: Realized vs Forecast",
+st.markdown("### Volatility Trend")
+vol_df = build_volatility_trend(filtered)
+if vol_df.empty:
+    st.info("Need more uploaded history to calculate a volatility trend.")
+else:
+    fig_vol = go.Figure()
+    avg_vol = vol_df.groupby("trade_date", as_index=False)[["realized_vol_20d", "forecast_vol"]].mean()
+    scale = 100 if filtered["daily_return"].notna().sum() >= 20 else 1
+    fig_vol.add_trace(go.Scatter(x=avg_vol["trade_date"], y=avg_vol["realized_vol_20d"] * scale, mode="lines", name="20-day realized volatility"))
+    fig_vol.add_trace(go.Scatter(x=avg_vol["trade_date"], y=avg_vol["forecast_vol"] * scale, mode="lines", name="Forecast volatility"))
+    fig_vol.update_layout(
+        title="Historical Volatility of Returns",
+        xaxis_title="Date",
+        yaxis_title="Daily volatility (%)" if scale == 100 else "Daily P/L volatility ($)",
+        hovermode="x unified",
     )
     st.plotly_chart(fig_vol, use_container_width=True)
 
-    with st.expander("Latest volatility regime by trader"):
-        st.dataframe(
-            latest_vol.style.format({
-                "rolling_realized_vol": "{:.2f}x",
-                "garch_style_forecast_vol": "{:.2f}x",
-            }),
-            use_container_width=True,
-        )
-
 left, right = st.columns([2, 1])
+curve_df = pd.concat([add_metrics(g) for _, g in filtered.groupby("trader_alias")], ignore_index=True)
+
+with left:
+    st.markdown("### Cumulative Returns")
+    if curve_df["daily_return"].notna().any():
+        fig = px.line(curve_df, x="trade_date", y="cumulative_return_pct", color="trader_alias", title="Cumulative Return (%)")
+        fig.update_yaxes(title="Cumulative return (%)")
+    else:
+        fig = px.line(curve_df, x="trade_date", y="cumulative_pl", color="trader_alias", title="Cumulative P/L")
+        fig.update_yaxes(title="Cumulative P/L ($)")
+    st.plotly_chart(fig, use_container_width=True)
+
 with right:
     st.markdown("### Summary")
     stats = summary_stats(filtered)
-    st.dataframe(
-        stats.style.format({
-            "total_pl": "${:,.0f}",
-            "avg_day": "${:,.0f}",
-            "median_day": "${:,.0f}",
-            "std_day": "${:,.0f}",
-            "best_day": "${:,.0f}",
-            "worst_day": "${:,.0f}",
-            "win_rate": "{:.1%}",
-            "profit_factor": "{:.2f}",
-            "max_drawdown": "${:,.0f}",
-        }),
-        use_container_width=True,
-    )
+    formatters = {
+        "total_pl": "${:,.0f}",
+        "avg_day": "${:,.0f}",
+        "median_day": "${:,.0f}",
+        "std_day": "${:,.0f}",
+        "best_day": "${:,.0f}",
+        "worst_day": "${:,.0f}",
+        "win_rate": "{:.1%}",
+        "profit_factor": "{:.2f}",
+    }
+    if "total_return" in stats.columns:
+        formatters["total_return"] = "{:.1%}"
+        formatters["daily_vol"] = "{:.2%}"
+    st.dataframe(stats.style.format(formatters), use_container_width=True)
 
-with left:
-    st.markdown("### Equity Curves")
-    curve_df = pd.concat([add_metrics(g) for _, g in filtered.groupby("trader_alias")], ignore_index=True)
-    fig = px.line(curve_df, x="trade_date", y="cumulative_pl", color="trader_alias", title="Cumulative P/L")
-    st.plotly_chart(fig, use_container_width=True)
+st.markdown("### Rolling 20-Day Returns")
+roll_rows = []
+for trader, g in filtered.groupby("trader_alias"):
+    g = g.sort_values("trade_date").copy()
+    if g["daily_return"].notna().sum() >= 20:
+        s = g["daily_return"].fillna(0)
+        g["rolling_20d_return"] = ((1 + s).rolling(20).apply(np.prod, raw=True) - 1) * 100
+    else:
+        g["rolling_20d_return"] = g["daily_pl"].rolling(20).sum()
+    roll_rows.append(g)
+roll_df = pd.concat(roll_rows, ignore_index=True)
+fig_roll = px.line(roll_df, x="trade_date", y="rolling_20d_return", color="trader_alias", title="Rolling 20-Day Return / P&L")
+st.plotly_chart(fig_roll, use_container_width=True)
 
-st.markdown("### Drawdowns")
-fig_dd = px.line(curve_df, x="trade_date", y="drawdown", color="trader_alias", title="Drawdown from Running Peak")
-st.plotly_chart(fig_dd, use_container_width=True)
-
-st.markdown("### Daily P/L Distribution")
-fig_hist = px.histogram(filtered, x="daily_pl", color="trader_alias", nbins=60, marginal="box", title="Daily P/L Histogram")
+st.markdown("### Daily Return Distribution")
+if filtered["daily_return"].notna().sum() >= 20:
+    hist_df = filtered.dropna(subset=["daily_return"]).copy()
+    hist_df["daily_return_pct"] = hist_df["daily_return"] * 100
+    fig_hist = px.histogram(hist_df, x="daily_return_pct", color="trader_alias", nbins=60, marginal="box", title="Daily Return Histogram (%)")
+    fig_hist.update_xaxes(title="Daily return (%)")
+else:
+    fig_hist = px.histogram(filtered, x="daily_pl", color="trader_alias", nbins=60, marginal="box", title="Daily P/L Histogram")
 st.plotly_chart(fig_hist, use_container_width=True)
 
-st.markdown("### Strategy Breakdown")
-strategy = filtered.groupby(["trader_alias", "strategy"], dropna=False)["daily_pl"].agg(["count", "sum", "mean", "min", "max"]).reset_index()
-st.dataframe(
-    strategy.style.format({"sum": "${:,.0f}", "mean": "${:,.0f}", "min": "${:,.0f}", "max": "${:,.0f}"}),
-    use_container_width=True,
-)
-
 with st.expander("Recent uploads"):
-    display_uploads = uploads_df[["uploaded_at", "trader_alias", "strategy_name", "row_count", "show_in_group", "original_filename"]].copy()
-    st.dataframe(display_uploads, use_container_width=True)
+    display_cols = ["uploaded_at", "trader_alias", "row_count", "show_in_group", "original_filename"]
+    if "account_size" in uploads_df.columns:
+        display_cols.insert(2, "account_size")
+    st.dataframe(uploads_df[display_cols], use_container_width=True)
 
 with st.expander("Export visible standardized dataset"):
     csv = public_results.to_csv(index=False).encode("utf-8")

@@ -1,26 +1,24 @@
-# Discord Trading Research Repository
+# ALGO Edge Performance History
 
-A no-login Streamlit app for Discord trading groups to upload TradeSteward-style CSV exports and view shared analytics.
+A no-login Streamlit app for Discord trading groups to upload TradeSteward-style CSV exports and view shared performance, volatility, and one-month projected return analytics.
 
 ## Features
 
 - No login required
 - Discord handle field
 - Anonymous upload option
-- Strategy name field
-- Account size and notes fields
+- Optional account size for percentage-return normalization
 - Toggle to show/hide results from the group dashboard
 - Standardizes TradeSteward-style date and P/L columns
-- Group equity curves
-- Drawdown curves
-- Daily P/L histograms
+- Front-page projected 1-month return graph
+- Monte Carlo projection using historical return volatility
+- EWMA/GARCH-style volatility forecast
+- Volatility trend dashboard
+- Cumulative returns
+- Rolling 20-day returns
+- Daily return/P&L distribution
 - Trader summary statistics
-- Strategy breakdown
 - Downloadable standardized group dataset
-- Volatility Trend dashboard
-- Rolling realized volatility
-- GARCH-style EWMA forecast volatility
-- Volatility regime classification
 
 ## Deploy on Streamlit
 
@@ -31,10 +29,6 @@ app.py
 ```
 
 Requirements are in `requirements.txt`.
-
-## Volatility note
-
-The volatility dashboard uses standardized daily P/L so traders with different account sizes can be compared by volatility regime. The GARCH-style forecast is an EWMA variance recursion designed to be lightweight and reliable on Streamlit Cloud. A future durable version can add account-size-normalized returns and a full GARCH package.
 
 ## Important MVP limitation
 
