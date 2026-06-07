@@ -1,33 +1,20 @@
-# Discord Trading Research Repository
+# ALGO Edge Performance History
 
-A no-login Streamlit app for Discord trading groups to upload TradeSteward-style CSV exports and view shared analytics.
+Clean restart Streamlit app for Discord trading-history uploads.
 
 ## Features
 
 - No login required
-- Discord handle field
-- Anonymous upload option
-- Strategy name field
-- Account size and notes fields
-- Toggle to show/hide results from the group dashboard
-- Standardizes TradeSteward-style date and P/L columns
-- Group equity curves
-- Drawdown curves
-- Daily P/L histograms
-- Trader summary statistics
-- Strategy breakdown
-- Downloadable standardized group dataset
+- Discord handle or anonymous upload
+- TradeSteward-style CSV normalization
+- Community return dashboard
+- Cumulative P/L
+- Rolling 20-day returns
+- Daily P/L distribution
+- Rolling volatility trend
+- Recent uploads
+- Standardized CSV export
 
-## Deploy on Streamlit
+## Deploy
 
-Main file path:
-
-```text
-app.py
-```
-
-Requirements are in `requirements.txt`.
-
-## Important MVP limitation
-
-This version stores data in local SQLite and local upload files. On Streamlit Community Cloud, local storage can reset when the app restarts or redeploys. For real group use, the next upgrade should move storage to Supabase.
+Main file path: `app.py`

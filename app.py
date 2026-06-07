@@ -10,7 +10,6 @@ from typing import Optional, Tuple
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 APP_DIR = Path(__file__).parent
@@ -28,7 +27,6 @@ PL_CANDIDATES = [
     "daily_pl", "daily p/l", "daily pnl", "p/l", "pl", "pnl", "net p/l", "net pnl",
     "totalnetprofitloss", "total net profit loss", "profit", "profit/loss", "net profit/loss"
 ]
-STRATEGY_CANDIDATES = ["strategy", "system", "setup", "tag", "model"]
 TRADE_COUNT_CANDIDATES = ["trades", "trade count", "number of trades", "count"]
 
 
@@ -40,7 +38,6 @@ def init_db() -> None:
                 upload_id TEXT PRIMARY KEY,
                 trader_alias TEXT NOT NULL,
                 discord_handle TEXT,
-                strategy_name TEXT,
                 account_size REAL,
                 notes TEXT,
                 show_in_group INTEGER NOT NULL DEFAULT 1,
@@ -60,7 +57,6 @@ def init_db() -> None:
                 trader_alias TEXT NOT NULL,
                 discord_handle TEXT,
                 trade_date TEXT NOT NULL,
-                strategy TEXT,
                 daily_pl REAL NOT NULL,
                 trade_count INTEGER,
                 source_row_number INTEGER,
@@ -70,10 +66,10 @@ def init_db() -> None:
             )
             """
         )
-        for table, columns in {
+        # migrations from prior builds
+        migrations = {
             "uploads": {
                 "discord_handle": "TEXT",
-                "strategy_name": "TEXT",
                 "account_size": "REAL",
                 "notes": "TEXT",
                 "show_in_group": "INTEGER NOT NULL DEFAULT 1",
@@ -82,7 +78,8 @@ def init_db() -> None:
                 "discord_handle": "TEXT",
                 "show_in_group": "INTEGER NOT NULL DEFAULT 1",
             },
-        }.items():
+        }
+        for table, columns in migrations.items():
             existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
             for col, definition in columns.items():
                 if col not in existing:
@@ -97,11 +94,11 @@ def clean_col(name: str) -> str:
 def find_column(columns: list[str], candidates: list[str]) -> Optional[str]:
     cleaned = {clean_col(c): c for c in columns}
     candidate_set = {clean_col(c) for c in candidates}
-    for c in candidate_set:
-        if c in cleaned:
-            return cleaned[c]
+    for candidate in candidate_set:
+        if candidate in cleaned:
+            return cleaned[candidate]
     for cleaned_name, original in cleaned.items():
-        if any(c in cleaned_name for c in candidate_set):
+        if any(candidate in cleaned_name for candidate in candidate_set):
             return original
     return None
 
@@ -119,44 +116,35 @@ def parse_money(series: pd.Series) -> pd.Series:
     )
 
 
-def normalize_tradesteward_csv(df: pd.DataFrame, fallback_strategy: str) -> Tuple[pd.DataFrame, dict]:
+def normalize_csv(df: pd.DataFrame) -> Tuple[pd.DataFrame, dict]:
     columns = list(df.columns)
     date_col = find_column(columns, DATE_CANDIDATES)
     pl_col = find_column(columns, PL_CANDIDATES)
-    strategy_col = find_column(columns, STRATEGY_CANDIDATES)
     trade_count_col = find_column(columns, TRADE_COUNT_CANDIDATES)
 
     if not date_col or not pl_col:
         raise ValueError(
-            "Could not identify the required date and P/L columns. Expected something like "
-            "OpenDate/Day/Date and TotalNetProfitLoss/Daily_PL/P&L."
+            "Could not identify required columns. Expected a date column like OpenDate/Day/Date "
+            "and a P/L column like TotalNetProfitLoss/Daily_PL/P&L."
         )
 
-    normalized = pd.DataFrame()
-    normalized["trade_date"] = pd.to_datetime(df[date_col], errors="coerce").dt.date.astype(str)
-    normalized["daily_pl"] = parse_money(df[pl_col])
-
-    if strategy_col:
-        normalized["strategy"] = df[strategy_col].astype(str).replace({"nan": fallback_strategy})
-    else:
-        normalized["strategy"] = fallback_strategy or "Unspecified"
-
+    out = pd.DataFrame()
+    out["trade_date"] = pd.to_datetime(df[date_col], errors="coerce")
+    out["daily_pl"] = parse_money(df[pl_col])
     if trade_count_col:
-        normalized["trade_count"] = pd.to_numeric(df[trade_count_col], errors="coerce").fillna(0).astype(int)
+        out["trade_count"] = pd.to_numeric(df[trade_count_col], errors="coerce")
     else:
-        normalized["trade_count"] = np.nan
-
-    normalized["source_row_number"] = np.arange(1, len(df) + 1)
-    normalized = normalized.dropna(subset=["trade_date", "daily_pl"])
-    normalized = normalized[normalized["trade_date"] != "NaT"]
+        out["trade_count"] = np.nan
+    out["source_row_number"] = np.arange(1, len(df) + 1)
+    out = out.dropna(subset=["trade_date", "daily_pl"]).copy()
+    out["trade_date"] = out["trade_date"].dt.date.astype(str)
 
     mapping = {
         "date_col": date_col,
         "pl_col": pl_col,
-        "strategy_col": strategy_col or "Not found; using strategy entered on upload form",
         "trade_count_col": trade_count_col or "Not found",
     }
-    return normalized, mapping
+    return out, mapping
 
 
 def file_sha256(content: bytes) -> str:
@@ -174,7 +162,6 @@ def safe_alias(discord_handle: str, anonymous: bool) -> str:
 def save_upload(
     trader_alias: str,
     discord_handle: str,
-    strategy_name: str,
     account_size: Optional[float],
     notes: str,
     show_in_group: bool,
@@ -185,26 +172,24 @@ def save_upload(
     upload_id = digest[:16]
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     stored_filename = f"{timestamp}_{upload_id}_{uploaded_file.name}"
-    stored_path = UPLOAD_DIR / stored_filename
-    stored_path.write_bytes(content)
+    (UPLOAD_DIR / stored_filename).write_bytes(content)
 
     raw_df = pd.read_csv(io.BytesIO(content))
-    normalized, mapping = normalize_tradesteward_csv(raw_df, strategy_name or "Unspecified")
+    normalized, mapping = normalize_csv(raw_df)
     show_flag = 1 if show_in_group else 0
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
             INSERT OR REPLACE INTO uploads
-            (upload_id, trader_alias, discord_handle, strategy_name, account_size, notes, show_in_group,
+            (upload_id, trader_alias, discord_handle, account_size, notes, show_in_group,
              original_filename, stored_filename, uploaded_at, file_hash, row_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 upload_id,
                 trader_alias,
                 discord_handle,
-                strategy_name,
                 account_size,
                 notes,
                 show_flag,
@@ -226,7 +211,6 @@ def save_upload(
                 "trader_alias",
                 "discord_handle",
                 "trade_date",
-                "strategy",
                 "daily_pl",
                 "trade_count",
                 "source_row_number",
@@ -236,8 +220,8 @@ def save_upload(
         conn.executemany(
             """
             INSERT OR REPLACE INTO daily_results
-            (upload_id, trader_alias, discord_handle, trade_date, strategy, daily_pl, trade_count, source_row_number, show_in_group)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (upload_id, trader_alias, discord_handle, trade_date, daily_pl, trade_count, source_row_number, show_in_group)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             list(records),
         )
@@ -252,15 +236,14 @@ def load_daily_results(public_only: bool = True) -> pd.DataFrame:
         df = pd.read_sql_query(f"SELECT * FROM daily_results {where}", conn)
     if df.empty:
         return df
-    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
     df["daily_pl"] = pd.to_numeric(df["daily_pl"], errors="coerce")
     return df.dropna(subset=["trade_date", "daily_pl"])
 
 
 def load_uploads() -> pd.DataFrame:
     with sqlite3.connect(DB_PATH) as conn:
-        df = pd.read_sql_query("SELECT * FROM uploads ORDER BY uploaded_at DESC", conn)
-    return df
+        return pd.read_sql_query("SELECT * FROM uploads ORDER BY uploaded_at DESC", conn)
 
 
 def add_metrics(df: pd.DataFrame) -> pd.DataFrame:
@@ -268,6 +251,8 @@ def add_metrics(df: pd.DataFrame) -> pd.DataFrame:
     out["cumulative_pl"] = out["daily_pl"].cumsum()
     out["running_peak"] = out["cumulative_pl"].cummax()
     out["drawdown"] = out["cumulative_pl"] - out["running_peak"]
+    out["rolling_20_day_pl"] = out["daily_pl"].rolling(20, min_periods=5).sum()
+    out["rolling_20_day_vol"] = out["daily_pl"].rolling(20, min_periods=5).std()
     return out
 
 
@@ -277,125 +262,39 @@ def summary_stats(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for trader, g in df.groupby("trader_alias"):
         s = g["daily_pl"].dropna()
+        gains = s[s > 0].sum()
         losses = abs(s[s < 0].sum())
-        profit_factor = s[s > 0].sum() / losses if losses > 0 else np.nan
-        m = add_metrics(g)
-        rows.append(
-            {
-                "trader_alias": trader,
-                "days": int(s.count()),
-                "total_pl": float(s.sum()),
-                "avg_day": float(s.mean()),
-                "median_day": float(s.median()),
-                "std_day": float(s.std(ddof=1)) if s.count() > 1 else np.nan,
-                "best_day": float(s.max()),
-                "worst_day": float(s.min()),
-                "win_rate": float((s > 0).mean()) if s.count() else np.nan,
-                "profit_factor": float(profit_factor) if pd.notna(profit_factor) else np.nan,
-                "max_drawdown": float(m["drawdown"].min()) if not m.empty else np.nan,
-                "first_day": g["trade_date"].min().date(),
-                "last_day": g["trade_date"].max().date(),
-            }
-        )
+        metrics = add_metrics(g)
+        rows.append({
+            "trader_alias": trader,
+            "days": int(len(s)),
+            "total_pl": float(s.sum()),
+            "avg_day": float(s.mean()),
+            "median_day": float(s.median()),
+            "std_day": float(s.std()) if len(s) > 1 else 0.0,
+            "best_day": float(s.max()),
+            "worst_day": float(s.min()),
+            "win_rate": float((s > 0).mean()),
+            "profit_factor": float(gains / losses) if losses > 0 else np.nan,
+            "max_drawdown": float(metrics["drawdown"].min()),
+            "first_day": g["trade_date"].min().date(),
+            "last_day": g["trade_date"].max().date(),
+        })
     return pd.DataFrame(rows).sort_values("total_pl", ascending=False)
-
-
-def community_daily(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.groupby("trade_date", as_index=False)["daily_pl"].sum().sort_values("trade_date")
-    out["cumulative_pl"] = out["daily_pl"].cumsum()
-    out["rolling_20_day_return"] = out["daily_pl"].rolling(20, min_periods=5).sum()
-    out["rolling_20_day_vol"] = out["daily_pl"].rolling(20, min_periods=5).std()
-    out["ewma_vol"] = out["daily_pl"].ewm(span=20, adjust=False).std()
-    return out
-
-
-def build_projection(daily: pd.DataFrame, horizon_days: int = 21, sims: int = 5000) -> pd.DataFrame:
-    """One-month projection cone from historical mean and recent EWMA volatility of daily P/L."""
-    s = daily["daily_pl"].dropna().astype(float)
-    if len(s) < 5:
-        return pd.DataFrame()
-
-    mu = float(s.tail(60).mean()) if len(s) >= 20 else float(s.mean())
-    hist_vol = float(s.std(ddof=1)) if len(s) > 1 else 0.0
-    ewma_vol = float(s.ewm(span=20, adjust=False).std().iloc[-1]) if len(s) > 3 else hist_vol
-    sigma = ewma_vol if np.isfinite(ewma_vol) and ewma_vol > 0 else hist_vol
-    if not np.isfinite(sigma) or sigma <= 0:
-        return pd.DataFrame()
-
-    rng = np.random.default_rng(42)
-    simulated_daily = rng.normal(loc=mu, scale=sigma, size=(sims, horizon_days))
-    paths = simulated_daily.cumsum(axis=1)
-    quantiles = np.percentile(paths, [10, 25, 50, 75, 90], axis=0)
-
-    last_date = pd.to_datetime(daily["trade_date"].max())
-    future_dates = pd.bdate_range(last_date + pd.Timedelta(days=1), periods=horizon_days)
-    projection = pd.DataFrame(
-        {
-            "date": future_dates,
-            "p10": quantiles[0],
-            "p25": quantiles[1],
-            "median": quantiles[2],
-            "p75": quantiles[3],
-            "p90": quantiles[4],
-        }
-    )
-    return projection
-
-
-def projection_chart(proj: pd.DataFrame) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=proj["date"], y=proj["p90"], mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=proj["date"], y=proj["p10"], mode="lines", fill="tonexty", line=dict(width=0),
-            name="10-90% range", hovertemplate="%{x|%b %d}<br>10th pct: $%{y:,.0f}<extra></extra>"
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=proj["date"], y=proj["p75"], mode="lines", line=dict(width=0), showlegend=False, hoverinfo="skip"
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=proj["date"], y=proj["p25"], mode="lines", fill="tonexty", line=dict(width=0),
-            name="25-75% range", hovertemplate="%{x|%b %d}<br>25th pct: $%{y:,.0f}<extra></extra>"
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=proj["date"], y=proj["median"], mode="lines+markers", name="Median projection",
-            hovertemplate="%{x|%b %d}<br>Median: $%{y:,.0f}<extra></extra>"
-        )
-    )
-    fig.add_hline(y=0, line_dash="dash")
-    fig.update_layout(
-        title="Projected 1-Month Community P/L",
-        xaxis_title="Projected trading day",
-        yaxis_title="Projected cumulative P/L",
-        hovermode="x unified",
-        legend_title_text="Projection band",
-    )
-    return fig
 
 
 st.set_page_config(page_title="ALGO Edge Performance History", layout="wide")
 init_db()
 
 st.title("ALGO Edge Performance History")
-st.caption("Open upload portal for TradeSteward-style CSVs. No login required. Use a Discord handle or stay anonymous.")
+st.caption("Simple Discord upload portal and return dashboard for systematic traders.")
 
 with st.sidebar:
     st.header("Upload Trading History")
     discord_handle = st.text_input("Discord handle", placeholder="@your_handle")
     anonymous = st.checkbox("Upload anonymously", value=False)
-    strategy_name = st.text_input("Strategy name", placeholder="0DTE / systematic options / etc.")
     account_size = st.number_input("Approx. account size (optional)", min_value=0.0, value=0.0, step=1000.0)
-    notes = st.text_area("Notes / setup description", placeholder="Optional: time period, sizing, symbols, risk rules...")
+    notes = st.text_area("Notes / setup description", placeholder="Optional: time period, sizing, risk rules...")
     show_in_group = st.checkbox("Show my results in the group dashboard", value=True)
     uploaded = st.file_uploader("Upload TradeSteward CSV", type=["csv"])
 
@@ -406,7 +305,6 @@ with st.sidebar:
             upload_id, normalized, mapping = save_upload(
                 alias,
                 discord_handle.strip(),
-                strategy_name.strip() or "Unspecified",
                 acct,
                 notes.strip(),
                 show_in_group,
@@ -419,37 +317,20 @@ with st.sidebar:
             st.error(str(exc))
 
     st.divider()
-    st.warning("Before uploading, remove account numbers, brokerage IDs, addresses, or other personal identifiers.")
+    st.warning("Remove account numbers, brokerage IDs, addresses, and personal identifiers before uploading.")
 
 public_results = load_daily_results(public_only=True)
 uploads_df = load_uploads()
 
 if public_results.empty:
     st.info("Upload a CSV to begin. The app expects a date column and a daily P/L column.")
-    if not uploads_df.empty:
-        st.subheader("Private/hidden uploads exist")
-        st.write("Some uploads may be hidden from the group dashboard because the uploader unchecked the visibility box.")
     st.stop()
 
-community = community_daily(public_results)
-projection = build_projection(community)
+st.subheader("Community Return Dashboard")
 
-st.subheader("Projected 1-Month Return Outlook")
-if projection.empty:
-    st.info("Need at least 5 visible trading days to create a projection cone.")
-else:
-    st.plotly_chart(projection_chart(projection), use_container_width=True)
-    end = projection.iloc[-1]
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Median 1-month projection", f"${end['median']:,.0f}")
-    c2.metric("Interquartile range", f"${end['p25']:,.0f} to ${end['p75']:,.0f}")
-    c3.metric("Wide range", f"${end['p10']:,.0f} to ${end['p90']:,.0f}")
-    st.caption("Projection uses historical daily community P/L, recent EWMA volatility, and 5,000 simulated 21-trading-day paths. It is not a prediction or recommendation.")
-
-st.subheader("Community Performance Dashboard")
 metric_cols = st.columns(4)
 metric_cols[0].metric("Visible traders", public_results["trader_alias"].nunique())
-metric_cols[1].metric("Total trading days", f"{len(public_results):,}")
+metric_cols[1].metric("Trading days", f"{len(public_results):,}")
 metric_cols[2].metric("Group net P/L", f"${public_results['daily_pl'].sum():,.0f}")
 metric_cols[3].metric("Uploads", f"{len(uploads_df):,}")
 
@@ -458,10 +339,17 @@ selected_traders = st.multiselect("Show traders", traders, default=traders)
 filtered = public_results[public_results["trader_alias"].isin(selected_traders)].copy()
 
 if filtered.empty:
-    st.warning("Select at least one trader to view the dashboard.")
+    st.warning("Select at least one trader.")
     st.stop()
 
+curve_df = pd.concat([add_metrics(g) for _, g in filtered.groupby("trader_alias")], ignore_index=True)
+
 left, right = st.columns([2, 1])
+with left:
+    st.markdown("### Cumulative Returns")
+    fig = px.line(curve_df, x="trade_date", y="cumulative_pl", color="trader_alias", title="Cumulative P/L")
+    st.plotly_chart(fig, use_container_width=True)
+
 with right:
     st.markdown("### Summary")
     stats = summary_stats(filtered)
@@ -480,35 +368,32 @@ with right:
         use_container_width=True,
     )
 
-with left:
-    st.markdown("### Cumulative Returns")
-    curve_df = pd.concat([add_metrics(g) for _, g in filtered.groupby("trader_alias")], ignore_index=True)
-    fig = px.line(curve_df, x="trade_date", y="cumulative_pl", color="trader_alias", title="Cumulative P/L")
-    st.plotly_chart(fig, use_container_width=True)
-
-st.markdown("### Volatility Trend")
-filtered_community = community_daily(filtered)
-fig_vol = go.Figure()
-fig_vol.add_trace(go.Scatter(x=filtered_community["trade_date"], y=filtered_community["rolling_20_day_vol"], mode="lines", name="20-day realized volatility"))
-fig_vol.add_trace(go.Scatter(x=filtered_community["trade_date"], y=filtered_community["ewma_vol"], mode="lines", name="EWMA volatility forecast"))
-fig_vol.update_layout(title="Daily P/L Volatility", xaxis_title="Date", yaxis_title="Daily P/L volatility", hovermode="x unified")
-st.plotly_chart(fig_vol, use_container_width=True)
-
-st.markdown("### Rolling 20-Day Return")
-fig_roll = px.line(filtered_community, x="trade_date", y="rolling_20_day_return", title="Rolling 20-Day Community P/L")
-st.plotly_chart(fig_roll, use_container_width=True)
+st.markdown("### Rolling 20-Day Returns")
+roll_df = curve_df.dropna(subset=["rolling_20_day_pl"])
+if roll_df.empty:
+    st.info("Need at least 5 trading days per trader to show rolling returns.")
+else:
+    fig_roll = px.line(roll_df, x="trade_date", y="rolling_20_day_pl", color="trader_alias", title="Rolling 20-Day P/L")
+    st.plotly_chart(fig_roll, use_container_width=True)
 
 st.markdown("### Daily P/L Distribution")
 fig_hist = px.histogram(filtered, x="daily_pl", color="trader_alias", nbins=60, marginal="box", title="Daily P/L Histogram")
 st.plotly_chart(fig_hist, use_container_width=True)
 
+st.markdown("### Volatility Trend")
+vol_df = curve_df.dropna(subset=["rolling_20_day_vol"])
+if vol_df.empty:
+    st.info("Need at least 5 trading days per trader to show volatility trend.")
+else:
+    fig_vol = px.line(vol_df, x="trade_date", y="rolling_20_day_vol", color="trader_alias", title="Rolling 20-Day Daily P/L Volatility")
+    st.plotly_chart(fig_vol, use_container_width=True)
+
 with st.expander("Recent uploads"):
-    display_cols = ["uploaded_at", "trader_alias", "strategy_name", "row_count", "show_in_group", "original_filename"]
-    display_uploads = uploads_df[[c for c in display_cols if c in uploads_df.columns]].copy()
-    st.dataframe(display_uploads, use_container_width=True)
+    cols = ["uploaded_at", "trader_alias", "row_count", "show_in_group", "original_filename"]
+    st.dataframe(uploads_df[[c for c in cols if c in uploads_df.columns]], use_container_width=True)
 
 with st.expander("Export visible standardized dataset"):
     csv = public_results.to_csv(index=False).encode("utf-8")
     st.download_button("Download standardized group CSV", csv, "standardized_group_trading_history.csv", "text/csv")
 
-st.caption("MVP note: this version stores data locally in the Streamlit app container. For durable Discord group use, move the database/storage to Supabase next.")
+st.caption("MVP note: this version stores data locally in the Streamlit app container. For durable group use, move storage to Supabase later.")
